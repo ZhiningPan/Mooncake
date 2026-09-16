@@ -237,7 +237,9 @@ if(USE_NOF)
   endforeach()
 
   set(SPDK_OPTIONAL_LIBS)
-  foreach(_lib vfio_user dma init env_dpdk log util blob bdev conf json jsonrpc sock thread trace vmd rpc)
+  # Modified By Yida (v3): keyring 系列是按需编译的子库（v26.09 新增），
+  # 旧版 SPDK 没有这些库——放进 OPTIONAL 列表，存在则链接，缺失静默跳过
+  foreach(_lib vfio_user dma init env_dpdk log util blob bdev conf json jsonrpc sock thread trace vmd rpc keyring keyring_file keyring_linux)
     if(EXISTS "${SPDK_LIB_DIR}/libspdk_${_lib}.a")
       list(APPEND SPDK_OPTIONAL_LIBS ${SPDK_LIB_DIR}/libspdk_${_lib}.a)
     else()
@@ -269,6 +271,11 @@ if(USE_NOF)
       ${DPDK_LIB_DIR}/librte_cryptodev.a
       ${DPDK_LIB_DIR}/librte_hash.a
       ${DPDK_LIB_DIR}/librte_rcu.a
+      # Modified By Yida (v3): DPDK 26.x 将 log/argparse/cmdline 从 librte_eal.a
+      # 拆分为独立库（rte_log/rte_argparse_* 符号缺失的根因），必须显式链接
+      ${DPDK_LIB_DIR}/librte_log.a
+      ${DPDK_LIB_DIR}/librte_argparse.a
+      ${DPDK_LIB_DIR}/librte_cmdline.a
       pthread
       dl
       numa
@@ -283,7 +290,16 @@ if(USE_NOF)
       ibverbs
       rdmacm
       ssl
-      bsd)
+      bsd
+      # Modified By Yida (v3): fuse_reply_*/fuse_session_* 等符号需要 fuse3；
+      # 必须加在 SPDK_STATIC_LIBS 里（而不是 mooncake_master 的 target_link_libraries），
+      # 否则 PUBLIC 传播顺序导致符号解析失败（部署文档第三节问题三）
+      /usr/lib64/libfuse3.so
+      # Modified By Yida (v3): keyring 三件套显式加在末尾（实测写法；
+      # 与上面 OPTIONAL foreach 重复无害，静态库按需取 object）
+      ${SPDK_LIB_DIR}/libspdk_keyring.a
+      ${SPDK_LIB_DIR}/libspdk_keyring_file.a
+      ${SPDK_LIB_DIR}/libspdk_keyring_linux.a)
 
   # Modified By Yida (v3): URMA transport (UMDK)。libspdk_nvme.a 中的 URMA
   # object 引用 liburma 符号，必须出现在链接列表（此处 SPDK_STATIC_LIBS 整体
