@@ -907,7 +907,12 @@ int ReportUrmaMemoryStats(bool require_dmabuf) {
 }  // namespace
 
 int main(int argc, char **argv) {
-    google::InitGoogleLogging(argv[0]);
+    // Modified By Yida: glog 可能已被链接库/前置代码初始化（或经历过
+    // ShutdownGoogleLogging），重复 Init 会直接 FATAL（utilities.cc:365）。
+    // 参照 stress_cluster_bench.cpp 的 guard 写法。
+    if (!google::IsGoogleLoggingInitialized()) {
+        google::InitGoogleLogging(argv[0]);
+    }
     FLAGS_logtostderr = true;
     gflags::SetUsageMessage(
         "NoF worker pool benchmark. Use --helpshort to list benchmark "
