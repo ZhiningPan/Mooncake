@@ -206,6 +206,8 @@ DEFINE_uint64(client_init_wait_seconds, 0,
               "warmup and background initialization time to settle.");
 DEFINE_bool(verify, true, "Verify data integrity after read");
 DEFINE_uint64(replica_num, 1, "Number of replicas for each object");
+DEFINE_uint64(nof_replica_num, 0,
+              "Number of NoF SSD replicas for each object");
 DEFINE_bool(hard_pin, false,
             "Pin objects to prevent eviction during benchmark");
 
@@ -282,6 +284,18 @@ class BenchmarkStats {
             total_failed_ += tr.failed_ops;
         }
         std::sort(merged_latencies_ns_.begin(), merged_latencies_ns_.end());
+    }
+
+    // Sequential Put loops prepare each value before calling put_from(). Use
+    // the sum of API call latencies as the measured wall time so buffer filling
+    // does not distort Store/NoF throughput.
+    void FinalizeSequential() {
+        Finalize();
+        const int64_t elapsed_ns =
+            std::accumulate(merged_latencies_ns_.begin(),
+                            merged_latencies_ns_.end(), int64_t(0));
+        start_ = Clock::time_point{};
+        end_ = start_ + Nanos(elapsed_ns);
     }
 
     double PercentileUs(double p) const {
@@ -463,9 +477,12 @@ class StressBenchmark {
         LOG(INFO) << "Writing " << FLAGS_num_keys << " keys, each "
                   << FLAGS_value_size / MB << " MB";
 
-        mooncake::ReplicateConfig config;
-        config.replica_num = FLAGS_replica_num;
-        config.with_hard_pin = FLAGS_hard_pin;
+        mooncake::ReplicateConfig config = MakeReplicateConfig();
+
+        BenchmarkStats put_stats;
+        put_stats.InitThreads(1, FLAGS_num_keys);
+        ThreadResult& put_result = put_stats.GetThreadResult(0);
+        put_result.latencies_ns.reserve(FLAGS_num_keys);
 
         size_t written = 0;
         size_t failed = 0;
@@ -477,6 +494,7 @@ class StressBenchmark {
             auto t0 = Clock::now();
             int ret = client_->put_from(key, buffer_, FLAGS_value_size, config);
             auto t1 = Clock::now();
+            RecordPutResult(put_result, ElapsedNanos(t0, t1), ret);
 
             if (ret != 0) {
                 LOG(ERROR) << "put_from failed for key=" << key
@@ -495,6 +513,8 @@ class StressBenchmark {
 
         LOG(INFO) << "Write complete: " << written << " succeeded, " << failed
                   << " failed";
+        put_stats.FinalizeSequential();
+        put_stats.Print("PUT BENCHMARK [" + FLAGS_scenario + "]");
         LOG(INFO) << "Waiting " << FLAGS_wait_seconds
                   << " seconds for reader to connect...";
         std::this_thread::sleep_for(std::chrono::seconds(FLAGS_wait_seconds));
@@ -567,24 +587,35 @@ class StressBenchmark {
         int buf_ret = AllocateThreadBuffers(FLAGS_num_threads);
         if (buf_ret != 0) return buf_ret;
 
-        mooncake::ReplicateConfig config;
-        config.replica_num = FLAGS_replica_num;
-        config.with_hard_pin = FLAGS_hard_pin;
+        mooncake::ReplicateConfig config = MakeReplicateConfig();
+
+        BenchmarkStats put_stats;
+        put_stats.InitThreads(1, FLAGS_num_keys);
+        ThreadResult& put_result = put_stats.GetThreadResult(0);
+        put_result.latencies_ns.reserve(FLAGS_num_keys);
 
         LOG(INFO) << "Phase 1: Writing " << FLAGS_num_keys << " keys...";
+        int put_ret = 0;
         for (size_t i = 0; i < FLAGS_num_keys; ++i) {
             std::string key = MakeKey(i);
             FillBuffer(i);
+            auto t0 = Clock::now();
             int ret = client_->put_from(key, buffer_, FLAGS_value_size, config);
+            auto t1 = Clock::now();
+            RecordPutResult(put_result, ElapsedNanos(t0, t1), ret);
             if (ret != 0) {
                 LOG(ERROR) << "put_from failed for key=" << key;
-                return ret;
+                put_ret = ret;
+                break;
             }
             if ((i + 1) % 50 == 0) {
                 LOG(INFO) << "  Written " << (i + 1) << "/" << FLAGS_num_keys;
             }
         }
         LOG(INFO) << "Write phase complete";
+        put_stats.FinalizeSequential();
+        put_stats.Print("LOCAL MEMORY PUT BENCHMARK");
+        if (put_ret != 0) return put_ret;
 
         int warmup_ret = DoWarmup();
         if (warmup_ret != 0) {
@@ -632,25 +663,36 @@ class StressBenchmark {
         int buf_ret = AllocateThreadBuffers(FLAGS_num_threads);
         if (buf_ret != 0) return buf_ret;
 
-        mooncake::ReplicateConfig config;
-        config.replica_num = FLAGS_replica_num;
-        config.with_hard_pin = FLAGS_hard_pin;
+        mooncake::ReplicateConfig config = MakeReplicateConfig();
+
+        BenchmarkStats put_stats;
+        put_stats.InitThreads(1, FLAGS_num_keys);
+        ThreadResult& put_result = put_stats.GetThreadResult(0);
+        put_result.latencies_ns.reserve(FLAGS_num_keys);
 
         LOG(INFO) << "Phase 1: Writing " << FLAGS_num_keys
                   << " keys (data may be offloaded to SSD)...";
+        int put_ret = 0;
         for (size_t i = 0; i < FLAGS_num_keys; ++i) {
             std::string key = MakeKey(i);
             FillBuffer(i);
+            auto t0 = Clock::now();
             int ret = client_->put_from(key, buffer_, FLAGS_value_size, config);
+            auto t1 = Clock::now();
+            RecordPutResult(put_result, ElapsedNanos(t0, t1), ret);
             if (ret != 0) {
                 LOG(ERROR) << "put_from failed for key=" << key;
-                return ret;
+                put_ret = ret;
+                break;
             }
             if ((i + 1) % 50 == 0) {
                 LOG(INFO) << "  Written " << (i + 1) << "/" << FLAGS_num_keys;
             }
         }
         LOG(INFO) << "Write phase complete";
+        put_stats.FinalizeSequential();
+        put_stats.Print("LOCAL DISK PUT BENCHMARK");
+        if (put_ret != 0) return put_ret;
 
         LOG(INFO) << "Waiting " << FLAGS_wait_seconds
                   << " seconds for offload/eviction to complete...";
@@ -752,10 +794,14 @@ class StressBenchmark {
         std::vector<size_t> seg_failed(segments.size(), 0);
         std::vector<mooncake::ReplicateConfig> configs(segments.size());
         for (size_t s = 0; s < segments.size(); ++s) {
-            configs[s].replica_num = FLAGS_replica_num;
-            configs[s].with_hard_pin = FLAGS_hard_pin;
+            configs[s] = MakeReplicateConfig();
             configs[s].preferred_segments = {segments[s]};
         }
+
+        BenchmarkStats put_stats;
+        put_stats.InitThreads(1, FLAGS_num_keys * segments.size());
+        ThreadResult& put_result = put_stats.GetThreadResult(0);
+        put_result.latencies_ns.reserve(FLAGS_num_keys * segments.size());
 
         size_t total_written = 0;
         size_t total_failed = 0;
@@ -770,6 +816,7 @@ class StressBenchmark {
                 int ret = client_->put_from(key, buffer_, FLAGS_value_size,
                                             configs[s]);
                 auto t1 = Clock::now();
+                RecordPutResult(put_result, ElapsedNanos(t0, t1), ret);
 
                 if (ret != 0) {
                     LOG(ERROR) << "put_from failed for key=" << key
@@ -796,6 +843,8 @@ class StressBenchmark {
 
         LOG(INFO) << "All segments write complete: " << total_written
                   << " succeeded, " << total_failed << " failed";
+        put_stats.FinalizeSequential();
+        put_stats.Print("SEGMENT PUT BENCHMARK");
 
         LOG(INFO) << "Waiting " << FLAGS_wait_seconds
                   << " seconds for reader to connect...";
@@ -1304,10 +1353,15 @@ class StressBenchmark {
         // pinning mirror RunSegmentWrite exactly.
         std::vector<mooncake::ReplicateConfig> configs(remove_segments.size());
         for (size_t s = 0; s < remove_segments.size(); ++s) {
-            configs[s].replica_num = FLAGS_replica_num;
-            configs[s].with_hard_pin = FLAGS_hard_pin;
+            configs[s] = MakeReplicateConfig();
             configs[s].preferred_segments = {remove_segments[s]};
         }
+
+        BenchmarkStats put_stats;
+        put_stats.InitThreads(1, FLAGS_num_keys * remove_segments.size());
+        ThreadResult& put_result = put_stats.GetThreadResult(0);
+        put_result.latencies_ns.reserve(FLAGS_num_keys *
+                                        remove_segments.size());
 
         LOG(INFO) << "Phase 1: Prefilling " << FLAGS_num_keys
                   << " keys to " << remove_segment_nums
@@ -1318,11 +1372,16 @@ class StressBenchmark {
                 const auto& segment = remove_segments[s];
                 std::string key = MakeRemoveKey(segment, i);
                 FillBuffer(i);
+                auto t0 = Clock::now();
                 int ret = client_->put_from(key, buffer_, FLAGS_value_size,
                                             configs[s]);
+                auto t1 = Clock::now();
+                RecordPutResult(put_result, ElapsedNanos(t0, t1), ret);
                 if (ret != 0) {
                     LOG(ERROR) << "put_from failed for key=" << key
                                << " segment=" << segment << " ret=" << ret;
+                    put_stats.FinalizeSequential();
+                    put_stats.Print("REMOVE PREFILL PUT BENCHMARK");
                     return ret;
                 }
             }
@@ -1333,6 +1392,8 @@ class StressBenchmark {
             }
         }
         LOG(INFO) << "Prefill phase complete";
+        put_stats.FinalizeSequential();
+        put_stats.Print("REMOVE PREFILL PUT BENCHMARK");
 
         // Phase 2: assemble the full key list in the same order as
         // RunSegmentRead (outer key index, inner segment).
@@ -1440,6 +1501,26 @@ class StressBenchmark {
     }
 
    private:
+    static mooncake::ReplicateConfig MakeReplicateConfig() {
+        mooncake::ReplicateConfig config;
+        config.replica_num = FLAGS_replica_num;
+        config.nof_replica_num = FLAGS_nof_replica_num;
+        config.with_hard_pin = FLAGS_hard_pin;
+        return config;
+    }
+
+    static void RecordPutResult(ThreadResult& result, int64_t latency_ns,
+                                int ret) {
+        result.latencies_ns.push_back(latency_ns);
+        ++result.total_keys;
+        ++result.total_queries;
+        if (ret == 0) {
+            result.total_bytes += FLAGS_value_size;
+        } else {
+            ++result.failed_ops;
+        }
+    }
+
     static std::string MakeKey(size_t idx) {
         return "bench_key_" + std::to_string(idx);
     }
@@ -1802,6 +1883,8 @@ int main(int argc, char* argv[]) {
     LOG(INFO) << "  Num keys:       " << FLAGS_num_keys;
     LOG(INFO) << "  Batch size:     " << FLAGS_batch_size;
     LOG(INFO) << "  Num threads:    " << FLAGS_num_threads;
+    LOG(INFO) << "  Memory replicas: " << FLAGS_replica_num;
+    LOG(INFO) << "  NoF replicas:   " << FLAGS_nof_replica_num;
     LOG(INFO) << "  Hard pin:       " << (FLAGS_hard_pin ? "yes" : "no");
     LOG(INFO) << "  SSD offload:    "
               << (FLAGS_enable_ssd_offload ? "yes" : "no");
@@ -1817,8 +1900,20 @@ int main(int argc, char* argv[]) {
     LOG(INFO) << "  Client init wait: " << FLAGS_client_init_wait_seconds
               << "s";
 
+    if (FLAGS_replica_num == 0 && FLAGS_nof_replica_num == 0) {
+        LOG(ERROR) << "--replica_num and --nof_replica_num cannot both be 0";
+        return -1;
+    }
+#ifndef USE_NOF
+    if (FLAGS_nof_replica_num > 0) {
+        LOG(ERROR) << "--nof_replica_num requires a build with -DUSE_NOF=ON";
+        return -1;
+    }
+#endif
+
     size_t total_data = FLAGS_num_keys * FLAGS_value_size;
-    if (total_data > FLAGS_global_segment_size * 9.5 / 10) {
+    if (FLAGS_replica_num > 0 &&
+        total_data > FLAGS_global_segment_size * 9.5 / 10) {
         LOG(WARNING) << "Total data (" << total_data / MB << " MB) may exceed "
                      << "95% of segment (" << FLAGS_global_segment_size / MB
                      << " MB). Master eviction may delete objects. "
